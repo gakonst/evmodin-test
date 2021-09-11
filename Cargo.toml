@@ -20,4 +20,5 @@ bytes = "1.1.0"
 ethabi = { git = "https://github.com/gakonst/ethabi/", branch = "patch-1" }
 
 [patch.'https://github.com/vorot93/evmodin']
-evmodin = { path = "../evmodin" }
+# evmodin = { path = "../evmodin" }
+evmodin = { git = "https://github.com/gakonst/evmodin", branch = "feat/hevm" }
