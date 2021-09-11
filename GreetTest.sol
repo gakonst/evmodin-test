@@ -8,10 +8,10 @@ contract Greet {
     }
 
     function testFoo() public {
-
+        require(x == 1, "not one");
     }
 
-    function testBar() public {
-        revert("1111");
+    function testFailFoo() public {
+        require(x == 2, "not two");
     }
 }
