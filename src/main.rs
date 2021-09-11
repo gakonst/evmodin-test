@@ -4,12 +4,13 @@ use ethers::{
     utils::{id, Solc},
 };
 use evmodin::{
-    util::mocked_host::MockedHost,
     continuation::resume_data::StateModifier,
     tracing::{NoopTracer, StdoutTracer, Tracer},
     AnalyzedCode, CallKind, ExecutionState, Message, Revision, StatusCode,
 };
 use std::sync::Arc;
+
+use evmodin_test::MockedHost;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -96,7 +97,7 @@ fn run<T: Tracer>(mut host: MockedHost, tracer: &mut T) -> eyre::Result<()> {
                         // we are borrowing the host inside the closure while also mutably
                         // borrowing it later in the execute call, which Rust does not
                         // allow.
-                        // host.set_block_number(U256::from_big_endian(&input[4..]));
+                        host.set_block_number(U256::from_big_endian(&input[4..]));
                     }
                     _ => {
                         panic!("Unknown cheat code");
