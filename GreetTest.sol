@@ -1,7 +1,7 @@
 pragma solidity ^0.8.6;
 
 contract Greet {
-    uint256 x;
+    uint256 public x;
 
     function setUp() public {
         x = 1;
