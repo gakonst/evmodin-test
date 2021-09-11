@@ -4,12 +4,21 @@ use ethers::{
     utils::{id, Solc},
 };
 use evmodin::{
-    tracing::NoopTracer, util::mocked_host::MockedHost, AnalyzedCode, CallKind, Message, Revision,
-    StatusCode,
+    tracing::{NoopTracer, StdoutTracer, Tracer},
+    util::mocked_host::MockedHost,
+    AnalyzedCode, CallKind, Message, Revision, StatusCode,
 };
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    if std::env::var("TRACE").is_ok() {
+        run(StdoutTracer::default())
+    } else {
+        run(NoopTracer)
+    }
+}
+
+fn run<T: Tracer>(mut tracer: T) -> eyre::Result<()> {
     // compile the contracts
     let compiled = Solc::new("./*.sol").build()?;
     let compiled = compiled.get("Greet").expect("could not find contract");
@@ -22,8 +31,6 @@ async fn main() -> eyre::Result<()> {
 
     // Note: This host does not support x-contract calls. How are we going to handle it?!
     let mut host = MockedHost::default();
-    let mut tracer = NoopTracer;
-
     // first make a call to `setUp()`, as done in DappTools
     let setup_id = id("setUp()").to_vec();
     let gas = 10_000_000;
