@@ -1,7 +1,311 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+use bytes::Bytes;
+use ethers::types::{Address, H256, U256};
+use evmodin::{
+    host::{AccessStatus, StorageStatus, TxContext},
+    Host, Message, Output, StatusCode,
+};
+use hex_literal::hex;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use std::{cmp::min, collections::HashMap};
+
+/// LOG record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogRecord {
+    /// The address of the account which created the log.
+    pub creator: Address,
+
+    /// The data attached to the log.
+    pub data: Bytes,
+
+    /// The log topics.
+    pub topics: Vec<H256>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelfdestructRecord {
+    /// The address of the account which has self-destructed.
+    pub selfdestructed: Address,
+
+    /// The address of the beneficiary account.
+    pub beneficiary: Address,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StorageValue {
+    pub value: H256,
+    pub dirty: bool,
+    pub access_status: AccessStatus,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Account {
+    /// The account nonce.
+    pub nonce: u64,
+    /// The account code.
+    pub code: Bytes,
+    /// The code hash. Can be a value not related to the actual code.
+    pub code_hash: H256,
+    /// The account balance.
+    pub balance: U256,
+    /// The account storage map.
+    pub storage: HashMap<H256, StorageValue>,
+}
+
+const MAX_RECORDED_ACCOUNT_ACCESSES: usize = 200;
+const MAX_RECORDED_CALLS: usize = 100;
+
+#[derive(Clone, Debug, Default)]
+pub struct Records {
+    /// The copy of call inputs for the recorded_calls record.
+    pub call_inputs: Vec<Bytes>,
+
+    pub blockhashes: Vec<u64>,
+    pub account_accesses: Vec<Address>,
+    pub calls: Vec<Message>,
+    pub logs: Vec<LogRecord>,
+    pub selfdestructs: Vec<SelfdestructRecord>,
+}
+
+#[derive(Debug)]
+pub struct MockedHost {
+    pub accounts: HashMap<Address, Account>,
+    pub tx_context: Arc<Mutex<TxContext>>,
+    pub block_hash: H256,
+    pub call_result: Output,
+    pub recorded: Mutex<Records>,
+}
+
+impl MockedHost {
+    pub fn set_block_number(&self, block_number: U256) {
+        let mut tx_context = self.tx_context.lock();
+        tx_context.block_number = block_number.as_u64();
+    }
+}
+
+impl Clone for MockedHost {
+    fn clone(&self) -> Self {
+        Self {
+            accounts: self.accounts.clone(),
+            tx_context: self.tx_context.clone(),
+            block_hash: self.block_hash,
+            call_result: self.call_result.clone(),
+            recorded: Mutex::new(self.recorded.lock().clone()),
+        }
+    }
+}
+
+impl Default for MockedHost {
+    fn default() -> Self {
+        Self {
+            accounts: Default::default(),
+            tx_context: Arc::new(Mutex::new(TxContext {
+                tx_gas_price: U256::zero(),
+                tx_origin: Address::zero(),
+                block_coinbase: Address::zero(),
+                block_number: 0,
+                block_timestamp: 0,
+                block_gas_limit: 0,
+                block_difficulty: U256::zero(),
+                chain_id: U256::zero(),
+                block_base_fee: U256::zero(),
+            })),
+            block_hash: H256::zero(),
+            call_result: Output {
+                status_code: StatusCode::Success,
+                gas_left: 0,
+                output_data: Bytes::new(),
+                create_address: Some(Address::zero()),
+            },
+            recorded: Default::default(),
+        }
+    }
+}
+
+impl Records {
+    fn record_account_access(&mut self, address: Address) {
+        if self.account_accesses.len() < MAX_RECORDED_ACCOUNT_ACCESSES {
+            self.account_accesses.push(address)
+        }
+    }
+}
+
+impl Host for MockedHost {
+    fn account_exists(&self, address: Address) -> bool {
+        self.recorded.lock().record_account_access(address);
+        self.accounts.contains_key(&address)
+    }
+
+    fn get_storage(&self, address: Address, key: H256) -> H256 {
+        self.recorded.lock().record_account_access(address);
+
+        self.accounts
+            .get(&address)
+            .and_then(|account| account.storage.get(&key).map(|value| value.value))
+            .unwrap_or_else(H256::zero)
+    }
+
+    fn set_storage(&mut self, address: Address, key: H256, value: H256) -> StorageStatus {
+        self.recorded.lock().record_account_access(address);
+
+        // Get the reference to the old value.
+        // This will create the account in case it was not present.
+        // This is convenient for unit testing and standalone EVM execution to preserve the
+        // storage values after the execution terminates.
+        let old = self
+            .accounts
+            .entry(address)
+            .or_default()
+            .storage
+            .entry(key)
+            .or_default();
+
+        // Follow https://eips.ethereum.org/EIPS/eip-1283 specification.
+        // WARNING! This is not complete implementation as refund is not handled here.
+
+        if old.value == value {
+            return StorageStatus::Unchanged;
+        }
+
+        let status = if !old.dirty {
+            old.dirty = true;
+            if old.value.is_zero() {
+                StorageStatus::Added
+            } else if !value.is_zero() {
+                StorageStatus::Modified
+            } else {
+                StorageStatus::Deleted
+            }
+        } else {
+            StorageStatus::ModifiedAgain
+        };
+
+        old.value = value;
+
+        status
+    }
+
+    fn get_balance(&self, address: Address) -> U256 {
+        self.recorded.lock().record_account_access(address);
+
+        self.accounts
+            .get(&address)
+            .map(|acc| acc.balance)
+            .unwrap_or_else(U256::zero)
+    }
+
+    fn get_code_size(&self, address: Address) -> U256 {
+        self.recorded.lock().record_account_access(address);
+
+        self.accounts
+            .get(&address)
+            .map(|acc| acc.code.len().into())
+            .unwrap_or_else(U256::zero)
+    }
+
+    fn get_code_hash(&self, address: Address) -> H256 {
+        self.recorded.lock().record_account_access(address);
+
+        self.accounts
+            .get(&address)
+            .map(|acc| acc.code_hash)
+            .unwrap_or_else(H256::zero)
+    }
+
+    fn copy_code(&self, address: Address, code_offset: usize, buffer: &mut [u8]) -> usize {
+        self.recorded.lock().record_account_access(address);
+
+        self.accounts
+            .get(&address)
+            .map(|acc| {
+                let code = &acc.code;
+
+                if code_offset >= code.len() {
+                    return 0;
+                }
+
+                let n = min(buffer.len(), code.len() - code_offset);
+
+                buffer[..n].copy_from_slice(&code[code_offset..code_offset + n]);
+
+                n
+            })
+            .unwrap_or(0)
+    }
+
+    fn selfdestruct(&mut self, address: Address, beneficiary: Address) {
+        let mut r = self.recorded.lock();
+
+        r.record_account_access(address);
+        r.selfdestructs.push(SelfdestructRecord {
+            selfdestructed: address,
+            beneficiary,
+        });
+    }
+
+    fn call(&mut self, msg: &Message) -> Output {
+        let mut r = self.recorded.lock();
+
+        r.record_account_access(msg.destination);
+
+        if r.calls.len() < MAX_RECORDED_CALLS {
+            r.calls.push(msg.clone());
+            let call_msg = msg;
+            if !call_msg.input_data.is_empty() {
+                r.call_inputs.push(call_msg.input_data.clone());
+            }
+        }
+        self.call_result.clone()
+    }
+
+    fn get_tx_context(&self) -> TxContext {
+        (*self.tx_context.lock()).clone()
+    }
+
+    fn get_block_hash(&self, block_number: u64) -> H256 {
+        self.recorded.lock().blockhashes.push(block_number);
+        self.block_hash
+    }
+
+    fn emit_log(&mut self, address: Address, data: &[u8], topics: &[H256]) {
+        self.recorded.lock().logs.push(LogRecord {
+            creator: address,
+            data: data.to_vec().into(),
+            topics: topics.to_vec(),
+        });
+    }
+
+    fn access_account(&mut self, address: Address) -> AccessStatus {
+        let mut r = self.recorded.lock();
+
+        // Check if the address have been already accessed.
+        let already_accessed = r.account_accesses.iter().any(|&a| a == address);
+
+        r.record_account_access(address);
+
+        if address.0 >= hex!("0000000000000000000000000000000000000001")
+            && address.0 <= hex!("0000000000000000000000000000000000000009")
+        {
+            return AccessStatus::Warm;
+        }
+
+        if already_accessed {
+            AccessStatus::Warm
+        } else {
+            AccessStatus::Cold
+        }
+    }
+
+    fn access_storage(&mut self, address: Address, key: H256) -> AccessStatus {
+        let value = self
+            .accounts
+            .entry(address)
+            .or_default()
+            .storage
+            .entry(key)
+            .or_default();
+        let access_status = value.access_status;
+        value.access_status = AccessStatus::Warm;
+        access_status
     }
 }
